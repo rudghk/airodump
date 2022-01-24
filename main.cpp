@@ -32,10 +32,18 @@ struct BSSIDInfo{
     Mac bssid;
     int8_t pwr;   // 범위 : 0 ~ -128
     uint16_t beacons;
-    uint16_t data;  // data frame 개수
+    uint16_t data;  // (QoS) data frame 개수
     uint16_t ch;
 //    uint8_t enc;
     char essid[50];
+
+    void set(Mac bid, int8_t power, uint16_t nBeacons, uint16_t nData, uint16_t channel){
+        this->bssid = bid;
+        this->pwr = power;
+        this->beacons = nBeacons;
+        this->data = nData;
+        this->ch = channel;
+    }
 
     void print(){
         std::cout << bssid.getMAC() +"\t";
@@ -64,18 +72,6 @@ void render(std::map<Mac, BSSIDInfo> infoMap){
     }
 }
 
-uint8_t getPresentSize(const u_char* packet){
-    uint8_t count = 0;
-    uint32_t present;
-    while (true) {
-        memcpy(&present, &packet[sizeof(RadiotapHdr)+(count*sizeof(present))], sizeof(present));
-        count++;
-        if((present >> 31) == 0)    //31bit 1이면 32bit present 더 존재 -> 31bit 0일때까지 present 존재
-            break;
-    }
-    return count*sizeof(present);
-}
-
 int main(int argc, char* argv[]) {
     if (!parse(&param, argc, argv))
         return -1;
@@ -98,59 +94,50 @@ int main(int argc, char* argv[]) {
             printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(pcap));
             break;
         }
+
         bool changed = false;       // Render flag
 
         // Get radiotap len
         struct RadiotapHdr* radiotapHdr = (struct RadiotapHdr*)packet;
         // Get channel and power
-        uint8_t presentSize = getPresentSize(packet);
+        uint8_t presentSize = radiotapHdr->getPresentSize();
         struct RadiotapFixedData* radiotapData = (struct RadiotapFixedData*)&packet[sizeof(RadiotapHdr)+presentSize];
         // Get frame type and BSSID
         struct BeaconHdr* beaconHdr = (struct BeaconHdr*)&packet[radiotapHdr->len];
         // beacon frame인 경우
-        if(beaconHdr->type == 0x80){        // beacon frame(0x80)
+        if(beaconHdr->type == BEACON_TYPE){
             auto info = infoMap.find(beaconHdr->bssid);
             if(info != infoMap.end()){  // 이미 알고 있는 bssid인 경우
-                info->second.beacons++;     // 해당 mac bssid에서 beacons++
-                info->second.ch = radiotapData->chFreq;
-                info->second.pwr = radiotapData->signal;
+                info->second.set(beaconHdr->bssid, radiotapData->signal, info->second.beacons+1, info->second.data, radiotapData->chFreq);
             }
             else{
                 BSSIDInfo bssidInfo;
-                bssidInfo.beacons = 1;
-                bssidInfo.bssid = beaconHdr->bssid;
-                bssidInfo.ch = radiotapData->chFreq;
-                bssidInfo.pwr = radiotapData->signal;
-                bssidInfo.data = 0;
+                bssidInfo.set(beaconHdr->bssid, radiotapData->signal, 1, 0, radiotapData->chFreq);
                 // Get ESSID
                 struct TagParm* tagParm = (struct TagParm*)&packet[(radiotapHdr->len)+sizeof(BeaconHdr)+12]; // beacon fixed parm 12 bytes
-                if(tagParm->tag == 0x0){    // SSID(0x0)
-                    memset(bssidInfo.essid, 0, sizeof(bssidInfo.essid));
-                    memcpy(&bssidInfo.essid, &packet[(radiotapHdr->len)+sizeof(BeaconHdr)+12+sizeof(TagParm)], tagParm->len);
-                    bssidInfo.essid[tagParm->len+1] = '\0';
+                while(tagParm->tag != 0x0){    // SSID(0x0)
+                    tagParm = tagParm->next();
                 }
+                memset(bssidInfo.essid, 0, sizeof(bssidInfo.essid));
+                memcpy(&bssidInfo.essid, tagParm->value(), tagParm->len);
+                bssidInfo.essid[tagParm->len+1] = '\0';
                 infoMap.insert({bssidInfo.bssid, bssidInfo});
             }
             changed = true;
         }
-        else if(beaconHdr->type == 0x08){   // data frame(0x08)
-            auto info = infoMap.find(beaconHdr->smac);  // data frame인 경우 smac 위치가 bssid
+        else if(beaconHdr->type == DATA_TYPE || beaconHdr->type == QOS_DATA_TYPE){  // Get #Data
+            Mac targetBSSID;
+            if(beaconHdr->type == DATA_TYPE)
+                targetBSSID = beaconHdr->smac;  // data frame인 경우 smac 위치가 bssid
+            else
+                targetBSSID = beaconHdr->dmac;  // QoS data frame인 경우 dmac 위치가 bssid
+            auto info = infoMap.find(targetBSSID);
             if(info != infoMap.end()){  // 이미 알고 있는 bssid인 경우
-                info->second.data++;     // 해당 mac bssid에서 data++
-                info->second.ch = radiotapData->chFreq;
-                info->second.pwr = radiotapData->signal;
+                info->second.set(beaconHdr->bssid, radiotapData->signal, info->second.beacons, info->second.data+1, radiotapData->chFreq);
             }
             changed = true;
         }
-        else if(beaconHdr->type == 0x88){   // QoS data frame(0x88)
-            auto info = infoMap.find(beaconHdr->dmac);  // QoS data frame인 경우 dmac 위치가 bssid
-            if(info != infoMap.end()){  // 이미 알고 있는 bssid인 경우
-                info->second.data++;     // 해당 mac bssid에서 data++
-                info->second.ch = radiotapData->chFreq;
-                info->second.pwr = radiotapData->signal;
-            }
-            changed = true;
-        }
+
         if(changed)
             render(infoMap);
     }
